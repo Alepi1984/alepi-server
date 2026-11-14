@@ -29,7 +29,7 @@ const pool = new Pool({
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '8mb' }));
-const commercialStrict = process.env.COMMERCIAL_AUTH_STRICT !== 'false';
+const commercialStrict = process.env.COMMERCIAL_AUTH_STRICT === 'true';
 
 async function authenticatedDevice(client, req, deviceId) {
   const token = bearerToken(req.headers.authorization);
