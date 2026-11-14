@@ -1,0 +1,17 @@
+{
+  "name": "alepi-business-api",
+  "version": "0.3.1",
+  "private": true,
+  "description": "API propia de ALEPI Business para LAN/Cloud sobre PostgreSQL.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^5.1.0",
+    "pg": "^8.13.1"
+  }
+}

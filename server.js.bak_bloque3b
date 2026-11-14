@@ -1,0 +1,473 @@
+require('dotenv').config();
+const express = require('express');
+const cors = require('cors');
+const crypto = require('crypto');
+const { Pool } = require('pg');
+
+const PORT = Number(process.env.PORT || 3100);
+const DATABASE_URL = process.env.DATABASE_URL;
+if (!DATABASE_URL) {
+  console.error('Falta DATABASE_URL en server/.env');
+  process.exit(1);
+}
+
+const useSsl = String(process.env.DB_SSL || 'false').toLowerCase() === 'true';
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: useSsl ? { rejectUnauthorized: false } : false,
+});
+
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: '8mb' }));
+
+const CORE_ENTITIES = new Set([
+  'empresas',
+  'sucursales',
+  'usuarios',
+  'usuario_empresas',
+  'configuracion_empresa',
+  'modulos_empresa',
+  'rol_permisos_empresa',
+]);
+
+function bool(v) {
+  return v === true || v === 1 || v === '1' || String(v).toLowerCase() === 'true';
+}
+
+function cleanPayload(payload) {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return {};
+  const out = { ...payload };
+  delete out.sync_estado;
+  delete out.version_local;
+  return out;
+}
+
+async function deviceHasCompany(client, deviceId, companyId) {
+  const result = await client.query(
+    'SELECT 1 FROM device_companies WHERE device_id = $1 AND company_id = $2 LIMIT 1',
+    [deviceId, companyId],
+  );
+  return result.rowCount > 0;
+}
+
+async function linkDeviceCompany(client, deviceId, companyId) {
+  await client.query(
+    `INSERT INTO device_companies(device_id, company_id, linked_at)
+     VALUES ($1,$2,NOW())
+     ON CONFLICT (device_id, company_id) DO NOTHING`,
+    [deviceId, companyId],
+  );
+}
+
+async function applyCoreChange(client, entity, payload) {
+  const p = cleanPayload(payload);
+  let result;
+
+  switch (entity) {
+    case 'empresas':
+      result = await client.query(
+        `INSERT INTO empresas
+          (id,nombre_comercial,razon_social,ruc,rubro,activo,creado_en,actualizado_en,eliminado_en,version_server)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,1)
+         ON CONFLICT (id) DO UPDATE SET
+           nombre_comercial=EXCLUDED.nombre_comercial,
+           razon_social=EXCLUDED.razon_social,
+           ruc=EXCLUDED.ruc,
+           rubro=EXCLUDED.rubro,
+           activo=EXCLUDED.activo,
+           actualizado_en=EXCLUDED.actualizado_en,
+           eliminado_en=EXCLUDED.eliminado_en,
+           version_server=empresas.version_server+1
+         WHERE EXCLUDED.actualizado_en >= empresas.actualizado_en
+         RETURNING *`,
+        [p.id, p.nombre_comercial, p.razon_social || null, p.ruc || null, p.rubro, bool(p.activo), p.creado_en, p.actualizado_en, p.eliminado_en || null],
+      );
+      break;
+
+    case 'sucursales':
+      result = await client.query(
+        `INSERT INTO sucursales
+          (id,empresa_id,codigo,nombre,direccion,activo,creado_en,actualizado_en,eliminado_en,version_server)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,1)
+         ON CONFLICT (id) DO UPDATE SET
+           empresa_id=EXCLUDED.empresa_id,
+           codigo=EXCLUDED.codigo,
+           nombre=EXCLUDED.nombre,
+           direccion=EXCLUDED.direccion,
+           activo=EXCLUDED.activo,
+           actualizado_en=EXCLUDED.actualizado_en,
+           eliminado_en=EXCLUDED.eliminado_en,
+           version_server=sucursales.version_server+1
+         WHERE EXCLUDED.actualizado_en >= sucursales.actualizado_en
+         RETURNING *`,
+        [p.id, p.empresa_id, p.codigo, p.nombre, p.direccion || null, bool(p.activo), p.creado_en, p.actualizado_en, p.eliminado_en || null],
+      );
+      break;
+
+    case 'usuarios':
+      result = await client.query(
+        `INSERT INTO usuarios
+          (id,usuario,nombre,credential_hash,activo,creado_en,actualizado_en,eliminado_en,version_server)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1)
+         ON CONFLICT (id) DO UPDATE SET
+           usuario=EXCLUDED.usuario,
+           nombre=EXCLUDED.nombre,
+           credential_hash=COALESCE(EXCLUDED.credential_hash, usuarios.credential_hash),
+           activo=EXCLUDED.activo,
+           actualizado_en=EXCLUDED.actualizado_en,
+           eliminado_en=EXCLUDED.eliminado_en,
+           version_server=usuarios.version_server+1
+         WHERE EXCLUDED.actualizado_en >= usuarios.actualizado_en
+         RETURNING *`,
+        [p.id, p.usuario, p.nombre, p.credential_hash || null, bool(p.activo), p.creado_en, p.actualizado_en, p.eliminado_en || null],
+      );
+      break;
+
+    case 'usuario_empresas':
+      result = await client.query(
+        `INSERT INTO usuario_empresas
+          (id,usuario_id,empresa_id,sucursal_id,rol_codigo,activo,creado_en,actualizado_en,version_server)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1)
+         ON CONFLICT (id) DO UPDATE SET
+           usuario_id=EXCLUDED.usuario_id,
+           empresa_id=EXCLUDED.empresa_id,
+           sucursal_id=EXCLUDED.sucursal_id,
+           rol_codigo=EXCLUDED.rol_codigo,
+           activo=EXCLUDED.activo,
+           actualizado_en=EXCLUDED.actualizado_en,
+           version_server=usuario_empresas.version_server+1
+         WHERE EXCLUDED.actualizado_en >= usuario_empresas.actualizado_en
+         RETURNING *`,
+        [p.id, p.usuario_id, p.empresa_id, p.sucursal_id || null, p.rol_codigo, bool(p.activo), p.creado_en, p.actualizado_en],
+      );
+      break;
+
+    case 'configuracion_empresa':
+      result = await client.query(
+        `INSERT INTO configuracion_empresa(id,empresa_id,clave,valor,actualizado_en,version_server)
+         VALUES ($1,$2,$3,$4,$5,1)
+         ON CONFLICT (id) DO UPDATE SET
+           empresa_id=EXCLUDED.empresa_id,
+           clave=EXCLUDED.clave,
+           valor=EXCLUDED.valor,
+           actualizado_en=EXCLUDED.actualizado_en,
+           version_server=configuracion_empresa.version_server+1
+         WHERE EXCLUDED.actualizado_en >= configuracion_empresa.actualizado_en
+         RETURNING *`,
+        [p.id, p.empresa_id, p.clave, p.valor == null ? null : String(p.valor), p.actualizado_en],
+      );
+      break;
+
+    case 'modulos_empresa':
+      result = await client.query(
+        `INSERT INTO modulos_empresa(id,empresa_id,modulo,habilitado,actualizado_en,version_server)
+         VALUES ($1,$2,$3,$4,$5,1)
+         ON CONFLICT (id) DO UPDATE SET
+           empresa_id=EXCLUDED.empresa_id,
+           modulo=EXCLUDED.modulo,
+           habilitado=EXCLUDED.habilitado,
+           actualizado_en=EXCLUDED.actualizado_en,
+           version_server=modulos_empresa.version_server+1
+         WHERE EXCLUDED.actualizado_en >= modulos_empresa.actualizado_en
+         RETURNING *`,
+        [p.id, p.empresa_id, p.modulo, bool(p.habilitado), p.actualizado_en],
+      );
+      break;
+
+    case 'rol_permisos_empresa':
+      result = await client.query(
+        `INSERT INTO rol_permisos_empresa(id,empresa_id,rol_codigo,permiso_codigo,permitido,actualizado_en,version_server)
+         VALUES ($1,$2,$3,$4,$5,$6,1)
+         ON CONFLICT (id) DO UPDATE SET
+           empresa_id=EXCLUDED.empresa_id,
+           rol_codigo=EXCLUDED.rol_codigo,
+           permiso_codigo=EXCLUDED.permiso_codigo,
+           permitido=EXCLUDED.permitido,
+           actualizado_en=EXCLUDED.actualizado_en,
+           version_server=rol_permisos_empresa.version_server+1
+         WHERE EXCLUDED.actualizado_en >= rol_permisos_empresa.actualizado_en
+         RETURNING *`,
+        [p.id, p.empresa_id, p.rol_codigo, p.permiso_codigo, bool(p.permitido), p.actualizado_en],
+      );
+      break;
+
+    default:
+      throw new Error(`Entidad no soportada: ${entity}`);
+  }
+
+  return result.rows[0] || null;
+}
+
+function canonicalServerPayload(entity, row) {
+  if (!row) return null;
+  const p = { ...row };
+  if (entity === 'usuarios') {
+    p.credential_hash = p.credential_hash || null;
+  }
+  return p;
+}
+
+async function companySnapshot(client, companyId) {
+  const company = await client.query('SELECT * FROM empresas WHERE id=$1', [companyId]);
+  const branches = await client.query('SELECT * FROM sucursales WHERE empresa_id=$1 ORDER BY nombre', [companyId]);
+  const memberships = await client.query('SELECT * FROM usuario_empresas WHERE empresa_id=$1', [companyId]);
+  const userIds = memberships.rows.map((r) => r.usuario_id);
+  const users = userIds.length
+    ? await client.query('SELECT * FROM usuarios WHERE id = ANY($1::text[])', [userIds])
+    : { rows: [] };
+  const config = await client.query('SELECT * FROM configuracion_empresa WHERE empresa_id=$1', [companyId]);
+  const modules = await client.query('SELECT * FROM modulos_empresa WHERE empresa_id=$1', [companyId]);
+  const permissions = await client.query('SELECT * FROM rol_permisos_empresa WHERE empresa_id=$1', [companyId]);
+  return {
+    empresas: company.rows,
+    sucursales: branches.rows,
+    usuarios: users.rows,
+    usuario_empresas: memberships.rows,
+    configuracion_empresa: config.rows,
+    modulos_empresa: modules.rows,
+    rol_permisos_empresa: permissions.rows,
+  };
+}
+
+function pairingCode() {
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  const bytes = crypto.randomBytes(8);
+  let out = '';
+  for (let i = 0; i < 8; i++) out += alphabet[bytes[i] % alphabet.length];
+  return `${out.slice(0, 4)}-${out.slice(4)}`;
+}
+
+app.get('/api/health', async (_req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT current_database() AS database,
+             NOW() AS server_time,
+             current_setting('server_version') AS postgres_version
+    `);
+    res.json({
+      ok: true,
+      servicio: 'ALEPI Business API',
+      version: '0.3.1',
+      postgres: result.rows[0],
+      arquitectura: 'OFFLINE_FIRST_HYBRID',
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ ok: false, error: 'DATABASE_UNAVAILABLE', detail: error.message });
+  }
+});
+
+app.post('/api/devices/register', async (req, res) => {
+  const { deviceId, deviceCode, platform, appVersion, label } = req.body || {};
+  if (!deviceId || !deviceCode) {
+    return res.status(400).json({ ok: false, error: 'deviceId y deviceCode son obligatorios' });
+  }
+  try {
+    const result = await pool.query(
+      `INSERT INTO alepi_devices
+        (id, device_code, platform, app_version, label, first_seen_at, last_seen_at)
+       VALUES ($1,$2,$3,$4,$5,NOW(),NOW())
+       ON CONFLICT (id) DO UPDATE SET
+         device_code = EXCLUDED.device_code,
+         platform = EXCLUDED.platform,
+         app_version = EXCLUDED.app_version,
+         label = COALESCE(EXCLUDED.label, alepi_devices.label),
+         last_seen_at = NOW()
+       RETURNING id, device_code, platform, app_version, label, first_seen_at, last_seen_at`,
+      [deviceId, deviceCode, platform || 'ANDROID', appVersion || null, label || null],
+    );
+    res.json({ ok: true, device: result.rows[0] });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ ok: false, error: 'DEVICE_REGISTER_FAILED', detail: error.message });
+  }
+});
+
+app.post('/api/sync/push', async (req, res) => {
+  const { deviceId, changes } = req.body || {};
+  if (!deviceId || !Array.isArray(changes)) {
+    return res.status(400).json({ ok: false, error: 'deviceId y changes son obligatorios' });
+  }
+  if (changes.length > 200) return res.status(400).json({ ok: false, error: 'Máximo 200 cambios por lote' });
+  const client = await pool.connect();
+  const ackedIds = [];
+  let applied = 0;
+  try {
+    await client.query('BEGIN');
+    const device = await client.query('SELECT id FROM alepi_devices WHERE id=$1', [deviceId]);
+    if (!device.rowCount) throw new Error('Dispositivo no registrado.');
+
+    for (const change of changes) {
+      const changeId = String(change.id || '');
+      const entity = String(change.entity || '');
+      const entityId = String(change.entityId || '');
+      const companyId = change.companyId ? String(change.companyId) : null;
+      if (!changeId || !entityId || !CORE_ENTITIES.has(entity)) throw new Error(`Cambio inválido: ${changeId || '(sin id)'}`);
+
+      const seen = await client.query('SELECT 1 FROM sync_inbox_receipts WHERE change_id=$1', [changeId]);
+      if (seen.rowCount) {
+        ackedIds.push(changeId);
+        continue;
+      }
+
+      if (companyId) {
+        const companyExists = await client.query('SELECT 1 FROM empresas WHERE id=$1', [companyId]);
+        const authorized = await deviceHasCompany(client, deviceId, companyId);
+        const firstCompanyPush = entity === 'empresas' && !companyExists.rowCount;
+        if (!authorized && !firstCompanyPush) throw new Error(`El dispositivo no está vinculado a la empresa ${companyId}.`);
+      }
+
+      const row = await applyCoreChange(client, entity, change.payload || {});
+      if (row) {
+        if (companyId) await linkDeviceCompany(client, deviceId, companyId);
+        await client.query(
+          `INSERT INTO sync_change_log(change_id,empresa_id,entidad,entidad_id,operacion,payload,origin_device_id,created_at)
+           VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,NOW())
+           ON CONFLICT DO NOTHING`,
+          [changeId, companyId, entity, entityId, change.operation || 'UPSERT', JSON.stringify(canonicalServerPayload(entity, row)), deviceId],
+        );
+        applied++;
+      }
+      await client.query(
+        'INSERT INTO sync_inbox_receipts(change_id,device_id,received_at) VALUES ($1,$2,NOW()) ON CONFLICT (change_id) DO NOTHING',
+        [changeId, deviceId],
+      );
+      ackedIds.push(changeId);
+    }
+    await client.query('UPDATE alepi_devices SET last_seen_at=NOW() WHERE id=$1', [deviceId]);
+    await client.query('COMMIT');
+    const cursor = await pool.query('SELECT COALESCE(MAX(seq),0)::text AS cursor FROM sync_change_log');
+    res.json({ ok: true, ackedIds, applied, cursor: cursor.rows[0].cursor });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error(error);
+    res.status(400).json({ ok: false, error: 'SYNC_PUSH_FAILED', detail: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.get('/api/sync/pull', async (req, res) => {
+  const deviceId = String(req.query.deviceId || '');
+  const cursor = Math.max(0, Number(req.query.cursor || 0));
+  const limit = Math.min(500, Math.max(1, Number(req.query.limit || 250)));
+  if (!deviceId) return res.status(400).json({ ok: false, error: 'deviceId obligatorio' });
+  try {
+    const links = await pool.query('SELECT company_id FROM device_companies WHERE device_id=$1', [deviceId]);
+    const companyIds = links.rows.map((r) => r.company_id);
+    if (!companyIds.length) return res.json({ ok: true, cursor: String(cursor), hasMore: false, changes: [] });
+    const result = await pool.query(
+      `SELECT seq,empresa_id,entidad,entidad_id,operacion,payload,origin_device_id,created_at
+       FROM sync_change_log
+       WHERE seq > $1 AND empresa_id = ANY($2::text[])
+       ORDER BY seq ASC
+       LIMIT $3`,
+      [cursor, companyIds, limit],
+    );
+    const nextCursor = result.rows.length ? String(result.rows[result.rows.length - 1].seq) : String(cursor);
+    res.json({
+      ok: true,
+      cursor: nextCursor,
+      hasMore: result.rows.length === limit,
+      changes: result.rows.map((r) => ({
+        seq: String(r.seq),
+        companyId: r.empresa_id,
+        entity: r.entidad,
+        entityId: r.entidad_id,
+        operation: r.operacion,
+        payload: r.payload,
+        originDeviceId: r.origin_device_id,
+        createdAt: r.created_at,
+      })),
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ ok: false, error: 'SYNC_PULL_FAILED', detail: error.message });
+  }
+});
+
+app.post('/api/pairing/create', async (req, res) => {
+  const { deviceId, companyId } = req.body || {};
+  if (!deviceId || !companyId) return res.status(400).json({ ok: false, error: 'deviceId y companyId obligatorios' });
+  const client = await pool.connect();
+  try {
+    const authorized = await deviceHasCompany(client, deviceId, companyId);
+    if (!authorized) return res.status(403).json({ ok: false, error: 'DEVICE_NOT_LINKED_TO_COMPANY' });
+    let code;
+    for (let i = 0; i < 10; i++) {
+      code = pairingCode();
+      const existing = await client.query('SELECT 1 FROM device_pair_codes WHERE code=$1', [code]);
+      if (!existing.rowCount) break;
+    }
+    const result = await client.query(
+      `INSERT INTO device_pair_codes(code,company_id,created_by_device_id,created_at,expires_at,status)
+       VALUES ($1,$2,$3,NOW(),NOW()+INTERVAL '15 minutes','ACTIVE')
+       RETURNING code, expires_at`,
+      [code, companyId, deviceId],
+    );
+    res.json({ ok: true, code: result.rows[0].code, expiresAt: result.rows[0].expires_at });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ ok: false, error: 'PAIRING_CREATE_FAILED', detail: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.post('/api/pairing/consume', async (req, res) => {
+  const { code, deviceId, deviceCode, platform, appVersion, label } = req.body || {};
+  if (!code || !deviceId || !deviceCode) return res.status(400).json({ ok: false, error: 'code, deviceId y deviceCode obligatorios' });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const pair = await client.query('SELECT * FROM device_pair_codes WHERE UPPER(code)=UPPER($1) FOR UPDATE', [String(code).trim()]);
+    if (!pair.rowCount) throw new Error('Código de vinculación no encontrado.');
+    const row = pair.rows[0];
+    if (row.status !== 'ACTIVE' || row.used_at) throw new Error('El código ya fue utilizado.');
+    if (new Date(row.expires_at).getTime() < Date.now()) throw new Error('El código de vinculación venció. Genera uno nuevo.');
+
+    await client.query(
+      `INSERT INTO alepi_devices(id,device_code,platform,app_version,label,first_seen_at,last_seen_at)
+       VALUES ($1,$2,$3,$4,$5,NOW(),NOW())
+       ON CONFLICT (id) DO UPDATE SET device_code=EXCLUDED.device_code,platform=EXCLUDED.platform,
+         app_version=EXCLUDED.app_version,label=COALESCE(EXCLUDED.label,alepi_devices.label),last_seen_at=NOW()`,
+      [deviceId, deviceCode, platform || 'ANDROID', appVersion || null, label || null],
+    );
+    await linkDeviceCompany(client, deviceId, row.company_id);
+    await client.query(
+      `UPDATE device_pair_codes SET status='USED',used_at=NOW(),used_by_device_id=$1 WHERE code=$2`,
+      [deviceId, row.code],
+    );
+    const snapshot = await companySnapshot(client, row.company_id);
+    const cursorResult = await client.query('SELECT COALESCE(MAX(seq),0)::text AS cursor FROM sync_change_log WHERE empresa_id=$1', [row.company_id]);
+    await client.query('COMMIT');
+    res.json({ ok: true, companyId: row.company_id, cursor: cursorResult.rows[0].cursor, snapshot });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error(error);
+    res.status(400).json({ ok: false, error: 'PAIRING_CONSUME_FAILED', detail: error.message });
+  } finally {
+    client.release();
+  }
+});
+
+app.get('/api/sync/status', async (_req, res) => {
+  try {
+    const devices = await pool.query('SELECT COUNT(*)::int AS total FROM alepi_devices');
+    const changes = await pool.query('SELECT COALESCE(MAX(seq),0)::bigint AS cursor FROM sync_change_log');
+    const links = await pool.query('SELECT COUNT(*)::int AS total FROM device_companies');
+    res.json({ ok: true, devices: devices.rows[0].total, linkedCompanies: links.rows[0].total, cursor: String(changes.rows[0].cursor) });
+  } catch (error) {
+    res.status(500).json({ ok: false, error: 'SYNC_STATUS_FAILED', detail: error.message });
+  }
+});
+
+app.use((req, res) => {
+  res.status(404).json({ ok: false, error: 'NOT_FOUND', path: req.path });
+});
+
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`ALEPI Business API v0.3.1 escuchando en http://0.0.0.0:${PORT}`);
+  console.log('SQLite sigue siendo operativo si esta API no está disponible.');
+});
